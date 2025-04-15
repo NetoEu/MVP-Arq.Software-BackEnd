@@ -1,0 +1,13 @@
+# Aqui vai todas as libs necessárias para rodar a aplicação(Em caso de não haver Docker).
+# Para rodar a versão mais recentes de cada Lib, basta não colocar o "== versão"
+
+
+Flask
+Flask-Cors
+flask-openapi3
+Flask-SQLAlchemy
+nose2
+pydantic
+SQLAlchemy
+SQLAlchemy-Utils
+typing_extensions
