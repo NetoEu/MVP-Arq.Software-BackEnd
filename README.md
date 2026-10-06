@@ -95,6 +95,27 @@ Os testes usam SQLite temporário e simulam o ViaCEP. Cobrem CRUD, persistência
 
 ### Certificados HTTPS em redes com proxy
 
+Se o erro ocorrer no `pip install` durante o build, forneça o arquivo PEM confiável como segredo de build `custom_ca`. O Dockerfile usa esse arquivo somente durante a instalação das dependências, sem incluí-lo na imagem e sem desativar HTTPS. A variável `REQUESTS_CA_BUNDLE` resolve a execução da API, mas não configura o pip durante a construção da imagem.
+
+Exemplo de `docker-compose.override.yml` local, ao lado do Compose usado para iniciar o projeto:
+
+```yaml
+services:
+  backend:
+    build:
+      secrets:
+        - custom_ca
+    environment:
+      REQUESTS_CA_BUNDLE: /certs/autoridades.pem
+    volumes:
+      - ./.local/certs:/certs:ro
+secrets:
+  custom_ca:
+    file: ./.local/certs/autoridades.pem
+```
+
+Coloque o PEM confiável em `.local/certs/autoridades.pem` e execute `docker compose up --build -d` nessa pasta. Mantenha os certificados e o override específicos da máquina fora do Git. Para demonstrar a API e o frontend juntos, use somente o Compose do frontend; ele já inicia o backend na porta 5000.
+
 Se o ambiente retornar `CERTIFICATE_VERIFY_FAILED`, configure `REQUESTS_CA_BUNDLE` com o caminho de um arquivo PEM contendo as autoridades certificadoras confiáveis da sua rede/sistema. Exemplo no PowerShell: `$env:REQUESTS_CA_BUNDLE = 'C:\certificados\autoridades.pem'`. O arquivo deve ser fornecido ou validado pelo responsável pela rede; não desative a verificação TLS. Em Docker, o arquivo também precisa estar montado no container e a variável deve apontar para o caminho interno correspondente.
 
 No CMD, antes de iniciar a API, use `set "REQUESTS_CA_BUNDLE=C:\certificados\autoridades.pem"`. Substitua pelo caminho de um arquivo existente. Essa configuração é específica do ambiente e não é uma dependência instalável pelo requirements.
