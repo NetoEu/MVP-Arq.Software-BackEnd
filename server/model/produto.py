@@ -17,3 +17,5 @@ class Pedido(Base):
     bairro = Column(String)
     cidade = Column(String)
     estado = Column(String)
+    valor_unitario_centavos = Column(Integer, nullable=True)
+    quantidade = Column(Integer, nullable=False, default=1)

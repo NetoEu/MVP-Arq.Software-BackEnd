@@ -1,126 +1,115 @@
-from flask_openapi3 import OpenAPI, Info, Tag
-from flask import redirect, request, jsonify
-from urllib.parse import unquote
-from sqlalchemy.exc import IntegrityError
-from model import Session, Pedido
-from schemas import *
-from flask_cors import CORS, cross_origin
+"""API de pedidos com documentação OpenAPI e integração ViaCEP."""
 import requests
+from flask import redirect
+from flask_cors import CORS
+from flask_openapi3 import Info, OpenAPI, Tag
+from pydantic import BaseModel, RootModel
+from sqlalchemy.exc import SQLAlchemyError
+from model import Pedido, Session
+from schemas.error import ErrorSchema
+from schemas.produto import CepPath, EnderecoOut, PedidoIn, PedidoOut, PedidoPath, PedidoUpdate
 
-info = Info(title="Minha API", version="1.0.0")
-app = OpenAPI(__name__, info=info)
+app = OpenAPI(__name__, info=Info(title="API de Controle de Pedidos", version="1.1.0"))
 CORS(app)
+pedido_tag = Tag(name="Pedidos", description="Cadastro, consulta, edição e exclusão")
+cep_tag = Tag(name="CEP", description="Endereços consultados no ViaCEP")
 
-home_tag = Tag(name="Documentação", description="Seleção de documentação: Swagger, Redoc ou RapiDoc")
-cep_tag = Tag(name="CEP", description="Busca de endereço pelo CEP")
-pedido_tag = Tag(name="Pedido", description="Operações relacionadas a pedidos")
+class Mensagem(BaseModel):
+    mensagem: str
 
-@app.get("/", tags=[home_tag])
-def home():
-    return redirect('/openapi'), 200
+class ListaPedidos(RootModel[list[PedidoOut]]):
+    pass
 
-@app.route("/api/cep/<cep>", methods=["GET"])
-def buscar_cep(cep):
+class ErroCEP(Exception):
+    def __init__(self, mensagem, status):
+        self.mensagem = mensagem
+        self.status = status
+
+@app.errorhandler(ErroCEP)
+def erro_cep(error):
+    return {"erro": error.mensagem}, error.status
+
+@app.errorhandler(SQLAlchemyError)
+def erro_banco(error):
+    app.logger.exception("Falha ao acessar o banco de dados")
+    return {"erro": "Não foi possível concluir a operação no banco de dados."}, 500
+
+def consultar_cep(cep):
     try:
-        response = requests.get(f"https://viacep.com.br/ws/{cep}/json/")
+        response = requests.get(f"https://viacep.com.br/ws/{cep}/json/", timeout=(3.05, 10))
+        response.raise_for_status()
         data = response.json()
-        if "erro" in data:
-            return jsonify({"error": "CEP não encontrado"}), 404
-        return jsonify(data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-@app.post("/api/pedido")
+        if not isinstance(data, dict):
+            raise ValueError("Resposta inválida")
+        if data.get("erro"):
+            raise ErroCEP("CEP não encontrado.", 404)
+        return EnderecoOut.model_validate(data)
+    except requests.Timeout as error:
+        raise ErroCEP("A consulta de CEP demorou demais. Tente novamente.", 504) from error
+    except (requests.RequestException, ValueError) as error:
+        raise ErroCEP("O serviço de CEP está indisponível. Tente novamente.", 502) from error
+
+def aplicar_endereco(pedido, endereco):
+    pedido.logradouro = endereco.logradouro
+    pedido.bairro = endereco.bairro
+    pedido.cidade = endereco.localidade
+    pedido.estado = endereco.uf
+
+def apresentar(pedido):
+    return PedidoOut.model_validate(pedido).model_dump(mode="json")
+
+@app.get("/", doc_ui=False)
+def home():
+    return redirect("/openapi")
+
+@app.get("/api/cep/<cep>", tags=[cep_tag], responses={200: EnderecoOut, 404: ErrorSchema, 502: ErrorSchema, 504: ErrorSchema})
+def buscar_cep(path: CepPath):
+    """Consulta um CEP com oito dígitos."""
+    return consultar_cep(path.cep).model_dump(mode="json")
+
+@app.post("/api/pedido", tags=[pedido_tag], responses={201: PedidoOut, 404: ErrorSchema, 502: ErrorSchema, 504: ErrorSchema})
 def criar_pedido(body: PedidoIn):
-    # Busca o endereço pelo CEP
-    response = requests.get(f"https://viacep.com.br/ws/{body.cep}/json/")  # Verifica se o CEP é válido
-    data = response.json()
+    """Cria um pedido e preenche o endereço pelo ViaCEP."""
+    endereco = consultar_cep(body.cep)
+    with Session.begin() as session:
+        pedido = Pedido(**body.model_dump())
+        aplicar_endereco(pedido, endereco)
+        session.add(pedido)
+        session.flush()
+        result = apresentar(pedido)
+    return result, 201
 
-    if "erro" in data:
-        return jsonify({"error": "CEP não encontrado"}), 404
-
-    novo_pedido = Pedido(
-        nome_cliente=body.nome_cliente,
-        produto=body.produto,
-        data_evento=body.data_evento,
-        cep=body.cep,
-        logradouro=data.get("logradouro"),
-        bairro=data.get("bairro"),
-        cidade=data.get("localidade"),
-        estado=data.get("uf")
-    )
-
-    session = Session()
-    session.add(novo_pedido)
-    session.commit()
-
-    # Converte PedidoOut para dicionário e retorna como resposta JSON
-    return jsonify(PedidoOut.from_orm(novo_pedido).dict())
-
-# Endpoint para listar todos os pedidos
-@app.get("/api/pedido", tags=[pedido_tag])
+@app.get("/api/pedido", tags=[pedido_tag], responses={200: ListaPedidos})
 def listar_pedidos():
-    session = Session()
-    pedidos = session.query(Pedido).all()
-    result = [PedidoOut.model_validate(pedido, from_attributes=True).model_dump() for pedido in pedidos]
-    session.close()
-    return jsonify(result)
+    """Lista os pedidos em ordem de data do evento e identificador."""
+    with Session() as session:
+        return [apresentar(p) for p in session.query(Pedido).order_by(Pedido.data_evento, Pedido.id).all()]
 
-@app.route("/api/pedido/<int:pedido_id>", methods=["DELETE"])
-@cross_origin()
-def deletar_pedido(pedido_id):
-    try:
-        session = Session()
-        pedido = session.get(Pedido, pedido_id)
-        if not pedido:
-            session.close()
-            return jsonify({"erro": "Pedido não encontrado"}), 404
+@app.put("/api/pedido/<int:pedido_id>", tags=[pedido_tag], responses={200: PedidoOut, 404: ErrorSchema, 502: ErrorSchema, 504: ErrorSchema})
+def atualizar_pedido(path: PedidoPath, body: PedidoUpdate):
+    """Atualiza os campos informados; um novo CEP atualiza o endereço."""
+    with Session.begin() as session:
+        pedido = session.get(Pedido, path.pedido_id)
+        if pedido is None:
+            return {"erro": "Pedido não encontrado."}, 404
+        changes = body.model_dump(exclude_unset=True)
+        if "cep" in changes and changes["cep"] != pedido.cep:
+            aplicar_endereco(pedido, consultar_cep(changes["cep"]))
+        for key, value in changes.items():
+            setattr(pedido, key, value)
+        session.flush()
+        result = apresentar(pedido)
+    return result
 
+@app.delete("/api/pedido/<int:pedido_id>", tags=[pedido_tag], responses={200: Mensagem, 404: ErrorSchema})
+def deletar_pedido(path: PedidoPath):
+    """Exclui um pedido pelo identificador."""
+    with Session.begin() as session:
+        pedido = session.get(Pedido, path.pedido_id)
+        if pedido is None:
+            return {"erro": "Pedido não encontrado."}, 404
         session.delete(pedido)
-        session.commit()
-        session.close()
-        return jsonify({"mensagem": "Pedido deletado com sucesso"})
-    except Exception as e:
-        return jsonify({"erro": f"Ocorreu um erro ao tentar excluir o pedido: {str(e)}"}), 500
-    
-@app.put("/api/pedido/<int:pedido_id>", tags=[pedido_tag])
-def atualizar_pedido(pedido_id: int, body: PedidoUpdate):
-    try:
-        session = Session()
-        pedido = session.get(Pedido, pedido_id)
-
-        if not pedido:
-            return jsonify({"erro": "Pedido não encontrado"}), 404
-
-        # Atualiza os campos se estiverem no body
-        if body.nome_cliente is not None:
-            pedido.nome_cliente = body.nome_cliente
-
-        if body.produto is not None:
-            pedido.produto = body.produto
-
-        if body.data_evento is not None:
-            pedido.data_evento = body.data_evento
-
-        if body.cep is not None and body.cep != pedido.cep:
-            response = requests.get(f"https://viacep.com.br/ws/{body.cep}/json/")
-            endereco = response.json()
-            if "erro" in endereco:
-                return jsonify({"erro": "Novo CEP inválido"}), 400
-
-            pedido.cep = body.cep
-            pedido.logradouro = endereco.get("logradouro", "")
-            pedido.bairro = endereco.get("bairro", "")
-            pedido.cidade = endereco.get("localidade", "")
-            pedido.estado = endereco.get("uf", "")
-
-        session.commit()
-        return PedidoOut.from_orm(pedido), 200
-
-    except Exception as e:
-        return jsonify({"erro": f"Erro ao atualizar pedido: {str(e)}"}), 500
-    finally:
-        session.close()
+    return {"mensagem": "Pedido excluído com sucesso."}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
